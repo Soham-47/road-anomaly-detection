@@ -3,10 +3,10 @@ import numpy as np
 import time
 import os
 import csv
+import argparse
 from datetime import datetime
 from threading import Thread
 
-# Try to use tflite_runtime for the Pi (lower overhead)
 try:
     from tflite_runtime.interpreter import Interpreter
 except ImportError:
@@ -14,7 +14,6 @@ except ImportError:
     Interpreter = tf.lite.Interpreter
 
 class VideoStream:
-    """Camera stream handling in a separate thread for better Performance"""
     def __init__(self, src=0, width=640, height=480):
         self.stream = cv2.VideoCapture(src)
         self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -51,8 +50,7 @@ class AnomalyDetector:
         self.input_width = self.input_details[0]['shape'][2]
         self.conf_threshold = conf_threshold
         
-        # Default RDD2022 labels if not provided
-        self.labels = ["alligator crack", "block crack", "longitudinal crack", "other corruption", "pothole", "repair", "transverse crack"] # Update this based on your specific classes
+        self.labels = ["alligator crack", "block crack", "longitudinal crack", "other corruption", "pothole", "repair", "transverse crack"]
         if labels_path and os.path.exists(labels_path):
             with open(labels_path, 'r') as f:
                 self.labels = [line.strip() for line in f.readlines()]
@@ -84,9 +82,8 @@ class AnomalyDetector:
         self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
         self.interpreter.invoke()
         
-        # YOLOv8/v11 TFLite output shape is usually [1, classes+4, 8400]
         output = self.interpreter.get_tensor(self.output_details[0]['index'])[0]
-        output = output.T # Transpose to [8400, classes+4]
+        output = output.T
         
         detections = []
         h, w, _ = frame.shape
@@ -97,11 +94,7 @@ class AnomalyDetector:
             confidence = scores[class_id]
             
             if confidence > self.conf_threshold:
-                # Center X, Center Y, Width, Height (normalized to input size)
                 cx, cy, bw, bh = pred[:4]
-                
-                # Rescale to original frame size
-                # Note: This assumes simple resize mapping, adjust if letterboxing was used
                 x1 = int((cx - bw/2) * w / self.input_width)
                 y1 = int((cy - bh/2) * h / self.input_height)
                 x2 = int((cx + bw/2) * w / self.input_width)
@@ -114,21 +107,18 @@ class AnomalyDetector:
                     "box": (x1, y1, x2, y2)
                 })
                 
-                # Log and save image
                 self.log_anomaly(label, confidence)
                 self.save_anomaly_snapshot(frame, label, (x1, y1, x2, y2))
                 
         return detections
 
     def save_anomaly_snapshot(self, frame, label, box):
-        """Saves a snapshot of the detected anomaly"""
         if not os.path.exists("detections"):
             os.makedirs("detections")
             
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"detections/{label}_{timestamp}.jpg"
         
-        # Draw box on a copy to save
         snapshot = frame.copy()
         x1, y1, x2, y2 = box
         cv2.rectangle(snapshot, (x1, y1), (x2, y2), (0, 0, 255), 2)
@@ -143,7 +133,6 @@ def main():
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
     args = parser.parse_args()
 
-    # CONFIGURATION
     MODEL_PATH = args.model
     SOURCE = args.video if args.video else 0
     W, H = 640, 480
@@ -163,13 +152,11 @@ def main():
             if frame is None:
                 continue
             
-            # Run detection and measure model speed
             infer_start = time.time()
             detections = detector.run_inference(frame)
             infer_time_ms = (time.time() - infer_start) * 1000
             model_fps = 1000 / infer_time_ms if infer_time_ms > 0 else 0
             
-            # Draw detections for display
             for det in detections:
                 x1, y1, x2, y2 = det["box"]
                 label = det["label"]
@@ -179,7 +166,6 @@ def main():
                 cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 10), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             
-            # FPS Calculation (display/capture speed)
             fps_counter += 1
             if (time.time() - fps_start_time) > 1:
                 fps = fps_counter / (time.time() - fps_start_time)

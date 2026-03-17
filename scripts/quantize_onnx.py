@@ -5,13 +5,10 @@ import os
 def quantize_onnx_model(input_model_path, output_model_path):
     print(f"Quantizing {input_model_path}...")
     
-    # Check if input exists
     if not os.path.exists(input_model_path):
         print(f"Error: {input_model_path} not found.")
         return
 
-    # Perform dynamic quantization
-    # This quantizes weights to INT8 and activations at runtime
     quantize_dynamic(
         model_input=input_model_path,
         model_output=output_model_path,
@@ -20,7 +17,6 @@ def quantize_onnx_model(input_model_path, output_model_path):
     
     print(f"Quantization complete. Saved to: {output_model_path}")
     
-    # Compare sizes
     old_size = os.path.getsize(input_model_path) / (1024 * 1024)
     new_size = os.path.getsize(output_model_path) / (1024 * 1024)
     print(f"Original size: {old_size:.2f} MB")

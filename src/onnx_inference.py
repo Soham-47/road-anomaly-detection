@@ -77,7 +77,7 @@ class ONNXAnomalyDetector:
     def run_inference(self, frame):
         input_data, ratio, padding = self.preprocess(frame)
         outputs = self.session.run([self.output_name], {self.input_name: input_data})
-        output = outputs[0][0].T 
+        output = outputs[0][0].T
         scores_all = output[:, 4:]
         max_scores = np.max(scores_all, axis=1)
         mask = max_scores > self.conf_threshold
@@ -135,7 +135,7 @@ class AsyncInference:
                 with self.lock:
                     self.detections = new_dets
                     self.latency = (time.time() - start) * 1000
-                    self.frame = None # Processed this frame
+                    self.frame = None
             else:
                 time.sleep(0.01)
 
@@ -174,14 +174,11 @@ def main():
     fps = 0
     frames_processed = 0
 
-    # Initialize Video Writer if --save is used
     out = None
     if args.save:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        # XVID is more robust on Linux
         fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        # Ensure we use .avi for XVID or .mp4 might fail on some players
         output_file = args.output if args.output.endswith('.avi') else args.output.rsplit('.', 1)[0] + '.avi'
         out = cv2.VideoWriter(output_file, fourcc, video_fps, (width, height))
         if not out.isOpened():
@@ -199,10 +196,7 @@ def main():
                     continue
                 break
             
-            # Send latest frame to background inference thread
             async_infer.set_frame(frame)
-            
-            # Get latest detections (won't block the video)
             detections, latency = async_infer.get_detections()
             
             for det in detections:
