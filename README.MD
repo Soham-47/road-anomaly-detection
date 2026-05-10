@@ -1,9 +1,3 @@
-## Demo Video
-
-https://github.com/Soham-47/road-anomaly-detection/detection_results(1).mp4
-
-
-
 # Real-Time Road Anomaly Detection (Raspberry Pi Edge AI)
 
 This project implements an edge AI application that processes dashcam footage in real-time to detect and log road anomalies such as potholes, cracks, and obstacles. It is optimized for high-performance inference on Raspberry Pi 5 hardware.
