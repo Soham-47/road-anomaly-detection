@@ -1,234 +1,323 @@
+import argparse
+import csv
+import time
+from datetime import datetime
+from pathlib import Path
+from threading import Lock, Thread
+
 import cv2
 import numpy as np
-import time
-import os
-import csv
-from datetime import datetime
 import onnxruntime as ort
-import argparse
-from threading import Thread, Lock
+
+try:
+    from src.inference_utils import decode_yolo_output, letterbox
+except ModuleNotFoundError:
+    from inference_utils import decode_yolo_output, letterbox
+
+
+DEFAULT_LABELS = [
+    "alligator crack",
+    "block crack",
+    "longitudinal crack",
+    "other corruption",
+    "pothole",
+    "repair",
+    "transverse crack",
+]
+DEFAULT_MODEL = Path(__file__).resolve().parents[1] / "models" / "best_road_anomaly.onnx"
+
 
 class ONNXAnomalyDetector:
-    def __init__(self, model_path, labels_path=None, conf_threshold=0.25, iou_threshold=0.45):
-        self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_name = self.session.get_outputs()[0].name
-        input_shape = self.session.get_inputs()[0].shape
-        self.input_height = input_shape[2]
-        self.input_width = input_shape[3]
+    def __init__(
+        self,
+        model_path,
+        labels_path=None,
+        conf_threshold=0.25,
+        iou_threshold=0.45,
+        output_dir=".",
+        event_interval=1.0,
+    ):
+        if not 0 <= conf_threshold <= 1:
+            raise ValueError("conf_threshold must be between 0 and 1")
+        if not 0 <= iou_threshold <= 1:
+            raise ValueError("iou_threshold must be between 0 and 1")
+        if event_interval < 0:
+            raise ValueError("event_interval must be non-negative")
+
+        self.session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        inputs = self.session.get_inputs()
+        outputs = self.session.get_outputs()
+        if len(inputs) != 1 or not outputs:
+            raise ValueError("ONNX model must expose one input and at least one output")
+        self.input_name = inputs[0].name
+        self.output_name = outputs[0].name
+        input_shape = inputs[0].shape
+        if len(input_shape) != 4 or not all(isinstance(value, (int, np.integer)) for value in input_shape[2:]):
+            raise ValueError(f"ONNX model must have a static image input, got {input_shape}")
+        self.input_height, self.input_width = int(input_shape[2]), int(input_shape[3])
+        if self.input_height <= 0 or self.input_width <= 0:
+            raise ValueError(f"invalid ONNX input dimensions: {input_shape}")
+
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
-        self.labels = ["alligator crack", "block crack", "longitudinal crack", "other corruption", "pothole", "repair", "transverse crack"]
-        if labels_path and os.path.exists(labels_path):
-            with open(labels_path, 'r') as f:
-                self.labels = [line.strip() for line in f.readlines()]
-        self.log_file = "onnx_anomaly_log.csv"
+        self.labels = DEFAULT_LABELS
+        if labels_path:
+            with open(labels_path, "r", encoding="utf-8") as labels_file:
+                self.labels = [line.strip() for line in labels_file if line.strip()]
+        if not self.labels:
+            raise ValueError("at least one class label is required")
+
+        self.output_dir = Path(output_dir)
+        self.detections_dir = self.output_dir / "onnx_detections"
+        self.log_file = self.output_dir / "onnx_anomaly_log.csv"
+        self.detections_dir.mkdir(parents=True, exist_ok=True)
+        self.event_interval = event_interval
+        self._last_events = []
         self._init_logger()
 
     def _init_logger(self):
-        if not os.path.exists(self.log_file):
-            with open(self.log_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["Timestamp", "AnomalyType", "Confidence"])
+        if not self.log_file.exists():
+            with self.log_file.open("w", newline="", encoding="utf-8") as log_file:
+                csv.writer(log_file).writerow(["Timestamp", "AnomalyType", "Confidence"])
 
     def log_anomaly(self, anomaly_type, confidence):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(self.log_file, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([timestamp, anomaly_type, confidence])
+        with self.log_file.open("a", newline="", encoding="utf-8") as log_file:
+            csv.writer(log_file).writerow(
+                [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), anomaly_type, float(confidence)]
+            )
 
     def preprocess(self, frame):
-        h, w = frame.shape[:2]
-        r = min(self.input_width / w, self.input_height / h)
-        new_unpad = (int(round(w * r)), int(round(h * r)))
-        dw, dh = self.input_width - new_unpad[0], self.input_height - new_unpad[1]
-        dw /= 2
-        dh /= 2
-        if (w, h) != new_unpad:
-            img = cv2.resize(frame, new_unpad, interpolation=cv2.INTER_LINEAR)
-        else:
-            img = frame.copy()
-        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32) / 255.0
-        img = img.transpose(2, 0, 1)
-        img = np.expand_dims(img, axis=0)
-        return img, r, (left, top)
-
-    def nms(self, boxes, scores, iou_threshold):
-        if len(boxes) == 0: return []
-        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-        areas = (x2 - x1) * (y2 - y1)
-        order = scores.argsort()[::-1]
-        keep = []
-        while order.size > 0:
-            i = order[0]
-            keep.append(i)
-            xx1, yy1 = np.maximum(x1[i], x1[order[1:]]), np.maximum(y1[i], y1[order[1:]])
-            xx2, yy2 = np.minimum(x2[i], x2[order[1:]]), np.minimum(y2[i], y2[order[1:]])
-            w, h = np.maximum(0.0, xx2 - xx1), np.maximum(0.0, yy2 - yy1)
-            inter = w * h
-            ovr = inter / (areas[i] + areas[order[1:]] - inter)
-            order = order[np.where(ovr <= iou_threshold)[0] + 1]
-        return keep
+        image, ratio, padding = letterbox(frame, self.input_width, self.input_height)
+        return image.transpose(2, 0, 1)[None, ...], ratio, padding
 
     def run_inference(self, frame):
         input_data, ratio, padding = self.preprocess(frame)
-        outputs = self.session.run([self.output_name], {self.input_name: input_data})
-        output = outputs[0][0].T
-        scores_all = output[:, 4:]
-        max_scores = np.max(scores_all, axis=1)
-        mask = max_scores > self.conf_threshold
-        filtered_output, filtered_scores = output[mask], max_scores[mask]
-        filtered_class_ids = np.argmax(scores_all[mask], axis=1)
-        if len(filtered_output) == 0: return []
-        boxes = []
-        for pred in filtered_output:
-            cx, cy, bw, bh = pred[:4]
-            x1 = (cx - bw/2 - padding[0]) / ratio
-            y1 = (cy - bh/2 - padding[1]) / ratio
-            x2 = (cx + bw/2 - padding[0]) / ratio
-            y2 = (cy + bh/2 - padding[1]) / ratio
-            boxes.append([x1, y1, x2, y2])
-        boxes = np.array(boxes)
-        indices = self.nms(boxes, filtered_scores, self.iou_threshold)
-        detections = []
-        for i in indices:
-            label = self.labels[filtered_class_ids[i]] if filtered_class_ids[i] < len(self.labels) else f"ID_{filtered_class_ids[i]}"
-            det = {"label": label, "confidence": float(filtered_scores[i]), "box": (int(boxes[i, 0]), int(boxes[i, 1]), int(boxes[i, 2]), int(boxes[i, 3]))}
-            detections.append(det)
-            self.log_anomaly(label, filtered_scores[i])
-            self.save_anomaly_snapshot(frame, label, det["box"])
+        output = self.session.run([self.output_name], {self.input_name: input_data})[0]
+        detections = decode_yolo_output(
+            output,
+            frame.shape,
+            self.input_width,
+            self.input_height,
+            ratio,
+            padding,
+            self.conf_threshold,
+            self.iou_threshold,
+            self.labels,
+        )
+        for detection in detections:
+            if self._event_allowed(detection):
+                self.log_anomaly(detection["label"], detection["confidence"])
+                self.save_anomaly_snapshot(frame, detection["label"], detection["box"])
         return detections
 
+    def _event_allowed(self, detection):
+        now = time.monotonic()
+        self._last_events = [
+            event for event in self._last_events if now - event["time"] < self.event_interval
+        ]
+        for event in self._last_events:
+            if event["label"] == detection["label"] and _box_iou(event["box"], detection["box"]) >= 0.5:
+                return False
+        self._last_events.append({"time": now, "label": detection["label"], "box": detection["box"]})
+        return True
+
     def save_anomaly_snapshot(self, frame, label, box):
-        if not os.path.exists("onnx_detections"): os.makedirs("onnx_detections")
-        filename = f"onnx_detections/{label}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+        safe_label = "".join(character if character.isalnum() or character in "-_." else "_" for character in label)
+        filename = self.detections_dir / f"{safe_label}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
         snapshot = frame.copy()
         x1, y1, x2, y2 = box
         cv2.rectangle(snapshot, (x1, y1), (x2, y2), (0, 0, 255), 2)
-        cv2.putText(snapshot, f"{label}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-        cv2.imwrite(filename, snapshot)
+        cv2.putText(snapshot, label, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        if not cv2.imwrite(str(filename), snapshot):
+            raise RuntimeError(f"Could not write detection snapshot: {filename}")
+
+
+def _box_iou(first, second):
+    x1 = max(first[0], second[0])
+    y1 = max(first[1], second[1])
+    x2 = min(first[2], second[2])
+    y2 = min(first[3], second[3])
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    first_area = max(0, first[2] - first[0]) * max(0, first[3] - first[1])
+    second_area = max(0, second[2] - second[0]) * max(0, second[3] - second[1])
+    union = first_area + second_area - intersection
+    return intersection / union if union else 0.0
+
 
 class AsyncInference:
     def __init__(self, detector):
         self.detector = detector
         self.frame = None
+        self.frame_sequence = 0
+        self.result_sequence = -1
+        self.result_frame = None
         self.detections = []
         self.stopped = False
         self.lock = Lock()
         self.latency = 0
+        self.thread = None
 
     def start(self):
-        Thread(target=self.update, args=(), daemon=True).start()
+        self.thread = Thread(target=self.update, daemon=True)
+        self.thread.start()
         return self
 
     def update(self):
-        while not self.stopped:
-            if self.frame is not None:
-                with self.lock:
+        while True:
+            with self.lock:
+                if self.stopped:
+                    return
+                if self.frame is None:
+                    local_frame = None
+                else:
                     local_frame = self.frame.copy()
-                start = time.time()
-                new_dets = self.detector.run_inference(local_frame)
-                with self.lock:
-                    self.detections = new_dets
-                    self.latency = (time.time() - start) * 1000
-                    self.frame = None
-            else:
+                    local_sequence = self.frame_sequence
+            if local_frame is None:
                 time.sleep(0.01)
+                continue
+
+            start = time.time()
+            new_detections = self.detector.run_inference(local_frame)
+            with self.lock:
+                self.detections = new_detections
+                self.latency = (time.time() - start) * 1000
+                self.result_sequence = local_sequence
+                self.result_frame = local_frame
+                # A newer frame may have arrived while inference was running.
+                if self.frame_sequence == local_sequence:
+                    self.frame = None
 
     def set_frame(self, frame):
         with self.lock:
-            self.frame = frame
+            self.frame_sequence += 1
+            self.frame = frame.copy()
+            return self.frame_sequence
 
-    def get_detections(self):
+    def get_detections(self, sequence=None):
         with self.lock:
-            return self.detections, self.latency
+            if sequence is not None and sequence != self.result_sequence:
+                return [], self.latency
+            return list(self.detections), self.latency
+
+    def get_result(self, last_sequence=None):
+        """Return each completed result with the frame that produced it."""
+        with self.lock:
+            if self.result_frame is None or self.result_sequence == last_sequence:
+                return None, [], self.latency, self.result_sequence
+            return (
+                self.result_frame.copy(),
+                list(self.detections),
+                self.latency,
+                self.result_sequence,
+            )
 
     def stop(self):
-        self.stopped = True
+        with self.lock:
+            self.stopped = True
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1)
+
+
+def _open_writer(path, fps, size):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for codec in ("mp4v", "XVID"):
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*codec), fps, size)
+        if writer.isOpened():
+            return writer
+        writer.release()
+    raise RuntimeError(f"Could not open video writer: {path}")
+
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--video", type=str, required=True)
-    parser.add_argument("--model", type=str, default="models/best_road_anomaly.onnx")
+    parser = argparse.ArgumentParser(description="ONNX inference for road anomaly detection")
+    parser.add_argument("--video", type=str, required=True, help="Path to the input video")
+    parser.add_argument("--model", type=str, default=str(DEFAULT_MODEL), help="Path to an ONNX model")
+    parser.add_argument("--labels", type=str, help="Optional newline-separated class labels")
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.45)
-    parser.add_argument("--save", action="store_true", default=False, help="Save the output video to a file")
-    parser.add_argument("--output", type=str, default="output_detection.mp4", help="Path to save the output video")
-    parser.add_argument("--show", action="store_true", default=True, help="Display the video")
-    parser.add_argument("--loop", action="store_true", default=False, help="Loop the video")
+    parser.add_argument("--output-dir", type=str, default=".", help="Directory for logs and snapshots")
+    parser.add_argument("--event-interval", type=float, default=1.0, help="Seconds before an overlapping event can be logged again")
+    parser.add_argument("--save", action="store_true", help="Save the annotated output video")
+    parser.add_argument("--output", type=str, default="output_detection.mp4", help="Output video path")
+    parser.add_argument("--show", dest="show", action="store_true", default=True, help="Display the video")
+    parser.add_argument("--no-show", dest="show", action="store_false", help="Disable the preview window")
+    parser.add_argument("--loop", action="store_true", help="Loop the video")
     args = parser.parse_args()
 
-    detector = ONNXAnomalyDetector(args.model, conf_threshold=args.conf, iou_threshold=args.iou)
-    async_infer = AsyncInference(detector).start()
-    
+    detector = ONNXAnomalyDetector(
+        args.model,
+        labels_path=args.labels,
+        conf_threshold=args.conf,
+        iou_threshold=args.iou,
+        output_dir=args.output_dir,
+        event_interval=args.event_interval,
+    )
     cap = cv2.VideoCapture(args.video)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {args.video}")
     video_fps = cap.get(cv2.CAP_PROP_FPS)
-    if video_fps <= 0 or video_fps > 120: video_fps = 30
-    frame_delay = int(1000 / video_fps)
-    fps_start_time = time.time()
-    fps_counter = 0
-    fps = 0
-    frames_processed = 0
+    if video_fps <= 0 or video_fps > 120:
+        video_fps = 30
+    frame_delay = max(1, int(1000 / video_fps))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if width <= 0 or height <= 0:
+        cap.release()
+        raise RuntimeError("Input video has invalid dimensions")
 
     out = None
-    if args.save:
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        output_file = args.output if args.output.endswith('.avi') else args.output.rsplit('.', 1)[0] + '.avi'
-        out = cv2.VideoWriter(output_file, fourcc, video_fps, (width, height))
-        if not out.isOpened():
-            print("Error: Could not open VideoWriter. Trying mp4v fallback...")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(args.output, fourcc, video_fps, (width, height))
-        print(f"Saving video to: {output_file if out.isOpened() else args.output}")
-
+    async_infer = None
+    last_result_sequence = -1
     try:
+        out = _open_writer(args.output, video_fps, (width, height)) if args.save else None
+        async_infer = AsyncInference(detector).start()
+        fps_start_time = time.time()
+        fps_counter = 0
+        fps = 0
         while True:
             ret, frame = cap.read()
             if not ret:
-                if args.loop:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                if args.loop and cap.set(cv2.CAP_PROP_POS_FRAMES, 0):
                     continue
                 break
-            
+
             async_infer.set_frame(frame)
-            detections, latency = async_infer.get_detections()
-            
-            for det in detections:
-                x1, y1, x2, y2 = det["box"]
+            result_frame, detections, latency, result_sequence = async_infer.get_result(
+                last_result_sequence
+            )
+            if result_frame is not None:
+                frame = result_frame
+                last_result_sequence = result_sequence
+            for detection in detections:
+                x1, y1, x2, y2 = detection["box"]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, f"{det['label']} {det['confidence']:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
+                cv2.putText(frame, f"{detection['label']} {detection['confidence']:.2f}", (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
             fps_counter += 1
-            if (time.time() - fps_start_time) > 1:
-                fps = fps_counter / (time.time() - fps_start_time)
+            elapsed = time.time() - fps_start_time
+            if elapsed > 1:
+                fps = fps_counter / elapsed
                 fps_counter = 0
                 fps_start_time = time.time()
-
-            model_fps = 1000 / latency if latency > 0 else 0
-            
+            pipeline_fps = 1000 / latency if latency > 0 else 0
             cv2.putText(frame, f"Video FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(frame, f"Model FPS: {model_fps:.1f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            
-            if out:
+            cv2.putText(frame, f"Pipeline FPS: {pipeline_fps:.1f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            if out is not None:
                 out.write(frame)
-                frames_processed += 1
-                if frames_processed % 30 == 0:
-                    print(f"Saved {frames_processed} frames...", end="\r")
-            
             if args.show:
                 cv2.imshow("Async Road Anomaly Detection", frame)
-                if cv2.waitKey(frame_delay) & 0xFF == ord('q'): break
+                if cv2.waitKey(frame_delay) & 0xFF == ord("q"):
+                    break
     finally:
-        async_infer.stop()
+        if async_infer is not None:
+            async_infer.stop()
         cap.release()
-        if out: out.release()
+        if out is not None:
+            out.release()
         cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,10 @@
 eda.ipynb
-pycache__/
+__pycache__/
+*.py[cod]
 checkpoints/
-.venv
+.venv/
 venv/
-onnx_detections
+detections/
+onnx_detections/
+*_log.csv
+output_detection.*

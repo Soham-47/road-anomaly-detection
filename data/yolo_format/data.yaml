@@ -1,6 +1,7 @@
 # YOLO Dataset Configuration
-# Path to dataset root
-path: /home/soham/Downloads/anomaly-detection/anomaly-detection/data/yolo_format
+# Dataset root. Set this to an absolute local path for direct Ultralytics
+# commands. The exporter supplies an absolute path at runtime.
+path: null
 
 # Train, val, test sets as relative paths to path/
 train: images/train

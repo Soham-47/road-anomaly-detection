@@ -1,6 +1,4 @@
-ultralytics==8.4.11
+# Runtime-only dependencies for Raspberry Pi TFLite inference.
 opencv-python==4.13.0.90
-numpy>=2
-onnxruntime>=1.18
-onnx>=1.16
+numpy>=1.24,<2
 tflite-runtime>=2.14; platform_machine == "aarch64" or platform_machine == "armv7l"
